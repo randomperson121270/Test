@@ -4,36 +4,86 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'Direct download URL'
+        description: 'Download URL (direct or TeraBox link)'
         required: true
       filename:
         description: 'Output filename (e.g. rom.zip)'
         required: false
         default: 'rom.zip'
+      download_type:
+        description: 'Download type'
+        required: true
+        default: 'direct'
+        type: choice
+        options:
+          - direct
+          - terabox
 
 jobs:
   upload:
     runs-on: ubuntu-22.04
     steps:
 
-      - name: Download file with aria2
+      - name: Free disk space
         run: |
-          sudo apt install -y aria2
-          aria2c -x16 -s16 -k1M --check-certificate=false \
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          sudo apt-get clean
+          df -h
+
+      - name: Install dependencies
+        run: sudo apt install -y aria2 curl jq
+
+      - name: Get direct link (TeraBox)
+        if: ${{ github.event.inputs.download_type == 'terabox' }}
+        run: |
+          echo "Fetching direct link from TeraBox..."
+          RESPONSE=$(curl -s -X POST "https://terasnap.netlify.app/api/download" \
+            -H "Content-Type: application/json" \
+            -d "{\"link\": \"${{ github.event.inputs.url }}\"}")
+          echo "API Response: $RESPONSE"
+          DIRECT_LINK=$(echo "$RESPONSE" | jq -r '.download_link // empty')
+          if [ -z "$DIRECT_LINK" ]; then
+            echo "Failed to get direct link from terasnap, trying fallback..."
+            DIRECT_LINK=$(curl -s "https://terabox.ashlynn.workers.dev/api?url=${{ github.event.inputs.url }}" | jq -r '.downloadLink // .direct // empty')
+          fi
+          if [ -z "$DIRECT_LINK" ]; then
+            echo "Error: Could not extract direct link from TeraBox"
+            exit 1
+          fi
+          echo "Direct link: $DIRECT_LINK"
+          echo "DOWNLOAD_URL=$DIRECT_LINK" >> $GITHUB_ENV
+
+      - name: Set direct URL
+        if: ${{ github.event.inputs.download_type == 'direct' }}
+        run: |
+          echo "DOWNLOAD_URL=${{ github.event.inputs.url }}" >> $GITHUB_ENV
+
+      - name: Download file
+        run: |
+          echo "Downloading from: $DOWNLOAD_URL"
+          aria2c -x16 -s16 -k1M \
+            --check-certificate=false \
+            --file-allocation=none \
+            --console-log-level=notice \
+            --summary-interval=5 \
             -o "${{ github.event.inputs.filename }}" \
-            "${{ github.event.inputs.url }}"
+            "$DOWNLOAD_URL"
+          echo ""
+          echo "Download complete!"
           ls -lh "${{ github.event.inputs.filename }}"
 
-      - name: Clone GoFile Upload script
+      - name: Clone GoFile uploader
         run: |
           git clone https://github.com/Sushrut1101/GoFile-Upload --depth=1
           chmod +x GoFile-Upload/upload.sh
 
       - name: Upload to GoFile
         run: |
+          echo "Uploading to GoFile..."
           cd GoFile-Upload
-          bash upload.sh "../${{ github.event.inputs.filename }}" | tee /tmp/gofile_result.txt
+          bash upload.sh "../${{ github.event.inputs.filename }}" 2>&1 | tee /tmp/result.txt
           echo ""
-          echo "=== GoFile Upload Result ==="
-          cat /tmp/gofile_result.txt
-          
+          echo "=============================="
+          echo "GoFile Upload Result:"
+          cat /tmp/result.txt
+          echo "=============================="
