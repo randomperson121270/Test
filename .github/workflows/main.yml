@@ -31,32 +31,99 @@ jobs:
           df -h
 
       - name: Install dependencies
-        run: sudo apt install -y aria2 curl jq
+        run: |
+          sudo apt install -y aria2 curl jq python3-pip
+          pip install playwright --break-system-packages
+          playwright install chromium --with-deps
 
-      - name: Get direct link (TeraBox)
+      - name: Get TeraBox direct link
         if: ${{ github.event.inputs.download_type == 'terabox' }}
         run: |
-          echo "Fetching direct link from TeraBox..."
-          RESPONSE=$(curl -s -X POST "https://terasnap.netlify.app/api/download" \
-            -H "Content-Type: application/json" \
-            -d "{\"link\": \"${{ github.event.inputs.url }}\"}")
-          echo "API Response: $RESPONSE"
-          DIRECT_LINK=$(echo "$RESPONSE" | jq -r '.download_link // empty')
-          if [ -z "$DIRECT_LINK" ]; then
-            echo "Failed to get direct link from terasnap, trying fallback..."
-            DIRECT_LINK=$(curl -s "https://terabox.ashlynn.workers.dev/api?url=${{ github.event.inputs.url }}" | jq -r '.downloadLink // .direct // empty')
-          fi
-          if [ -z "$DIRECT_LINK" ]; then
-            echo "Error: Could not extract direct link from TeraBox"
-            exit 1
-          fi
-          echo "Direct link: $DIRECT_LINK"
-          echo "DOWNLOAD_URL=$DIRECT_LINK" >> $GITHUB_ENV
+          cat > /tmp/terabox.py << 'PYEOF'
+          import asyncio
+          import os
+          from playwright.async_api import async_playwright
+
+          async def get_direct_link(share_url, email, password):
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context()
+                  page = await context.new_page()
+
+                  # Go to TeraBox
+                  print(f"Opening: {share_url}")
+                  await page.goto("https://www.terabox.com/")
+                  await page.wait_for_timeout(2000)
+
+                  # Login
+                  print("Logging in...")
+                  await page.goto("https://www.terabox.com/passport/email_login")
+                  await page.wait_for_timeout(2000)
+                  await page.fill('input[name="email"]', email)
+                  await page.fill('input[name="password"]', password)
+                  await page.click('button[type="submit"]')
+                  await page.wait_for_timeout(3000)
+
+                  # Go to share link
+                  print("Opening share link...")
+                  await page.goto(share_url)
+                  await page.wait_for_timeout(3000)
+
+                  # Intercept download URL
+                  direct_url = None
+
+                  async def handle_request(request):
+                      nonlocal direct_url
+                      url = request.url
+                      if "baidupcs.com" in url or "terabox.com/api/download" in url or "ufox.u.qiniucdn.com" in url:
+                          direct_url = url
+                          print(f"Captured: {url[:100]}...")
+
+                  page.on("request", handle_request)
+
+                  # Click download button
+                  try:
+                      await page.click('button:has-text("Download")', timeout=5000)
+                  except:
+                      try:
+                          await page.click('[data-track="download"]', timeout=5000)
+                      except:
+                          print("Could not find download button, trying all buttons...")
+                          buttons = await page.query_selector_all('button')
+                          for btn in buttons:
+                              text = await btn.inner_text()
+                              print(f"Button: {text}")
+
+                  await page.wait_for_timeout(5000)
+                  await browser.close()
+
+                  return direct_url
+
+          async def main():
+              url = os.environ["SHARE_URL"]
+              email = os.environ["TERABOX_EMAIL"]
+              password = os.environ["TERABOX_PASSWORD"]
+
+              link = await get_direct_link(url, email, password)
+              if link:
+                  print(f"DIRECT_LINK={link}")
+                  with open(os.environ["GITHUB_ENV"], "a") as f:
+                      f.write(f"DOWNLOAD_URL={link}\n")
+              else:
+                  print("ERROR: Could not get direct link")
+                  exit(1)
+
+          asyncio.run(main())
+          PYEOF
+          python3 /tmp/terabox.py
+        env:
+          SHARE_URL: ${{ github.event.inputs.url }}
+          TERABOX_EMAIL: ${{ secrets.TERABOX_EMAIL }}
+          TERABOX_PASSWORD: ${{ secrets.TERABOX_PASSWORD }}
 
       - name: Set direct URL
         if: ${{ github.event.inputs.download_type == 'direct' }}
-        run: |
-          echo "DOWNLOAD_URL=${{ github.event.inputs.url }}" >> $GITHUB_ENV
+        run: echo "DOWNLOAD_URL=${{ github.event.inputs.url }}" >> $GITHUB_ENV
 
       - name: Download file
         run: |
@@ -68,7 +135,6 @@ jobs:
             --summary-interval=5 \
             -o "${{ github.event.inputs.filename }}" \
             "$DOWNLOAD_URL"
-          echo ""
           echo "Download complete!"
           ls -lh "${{ github.event.inputs.filename }}"
 
