@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt install -y aria2 curl jq python3-pip
-          pip install playwright --break-system-packages
+          pip3 install playwright
           playwright install chromium --with-deps
 
       - name: Get TeraBox direct link
